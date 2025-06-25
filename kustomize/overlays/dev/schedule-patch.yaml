@@ -1,0 +1,6 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgsql-sql-backup
+spec:
+  schedule: "0 1 * * *" # Dev schedule (1 AM every day)

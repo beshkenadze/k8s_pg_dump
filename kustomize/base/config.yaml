@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-backup-configs
+data:
+  # Database configuration
+  PG_HOST: "<your-db-host-placeholder>"
+  PG_DATABASE: "your_database"
+  
+  # S3 configuration
+  S3_BUCKET_PATH: "your-bucket-name/postgres-backups"
+  
+  # Monitoring configuration
+  PUSHGATEWAY_URL: "http://pushgateway:9091"
+  
+  # Backup parameters
+  ENVIRONMENT: "default"
+  MAX_RETRIES: "3"
+  RETRY_WAIT: "30"
+  ENABLE_DEBUG: "false"
+  CREATE_MANIFEST: "true"
+  RETENTION_DAYS: "30"  # Default retention period in days
+  
+  # Schedule (in cron format)
+  BACKUP_SCHEDULE: "0 2 * * *"

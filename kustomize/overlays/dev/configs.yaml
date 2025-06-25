@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-backup-configs
+data:
+  # Database configuration
+  PG_HOST: "postgres-postgresql.dev.svc.cluster.local"
+  PG_DATABASE: "chat"
+  
+  # S3 configuration
+  S3_BUCKET_PATH: "postgres-backups-242201276690/dev-backups"
+  
+  # Monitoring configuration
+  PUSHGATEWAY_URL: "http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091"
+  
+  # Backup parameters
+  ENVIRONMENT: "dev"
+  MAX_RETRIES: "2"
+  RETRY_WAIT: "10"
+  ENABLE_DEBUG: "true"
+  CREATE_MANIFEST: "true"
+  RETENTION_DAYS: "14"  # Keep dev backups for 14 days
+  
+  # Schedule (in cron format)
+  BACKUP_SCHEDULE: "0 1 * * *"

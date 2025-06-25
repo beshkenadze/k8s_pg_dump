@@ -1,0 +1,106 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgsql-sql-backup
+spec:
+  schedule: "0 2 * * *" # Default schedule, will be patched
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: POSTGRES_IMAGE_PLACEHOLDER # Kustomize will patch this per environment
+              env:
+                # Database connection
+                - name: PGHOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: PG_HOST
+                - name: PGDATABASE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: PG_DATABASE
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-backup-secrets
+                      key: pg_username
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-backup-secrets
+                      key: pg_password
+                      
+                # AWS credentials
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-backup-secrets
+                      key: aws_access_key_id
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-backup-secrets
+                      key: aws_secret_access_key
+                      
+                # Backup parameters
+                - name: BACKUP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-backup-secrets
+                      key: encrypt_password
+                - name: S3_BUCKET_PATH
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: S3_BUCKET_PATH
+                      
+                # Monitoring
+                - name: PUSHGATEWAY_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: PUSHGATEWAY_URL
+                      
+                # Environment configuration
+                - name: ENVIRONMENT
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: ENVIRONMENT
+                - name: MAX_RETRIES
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: MAX_RETRIES
+                - name: RETRY_WAIT
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: RETRY_WAIT
+                - name: ENABLE_DEBUG
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: ENABLE_DEBUG
+                - name: CREATE_MANIFEST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pg-backup-configs
+                      key: CREATE_MANIFEST
+              command:
+                - /bin/bash
+                - /scripts/backup.sh
+              volumeMounts:
+                - name: backup-scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: backup-scripts
+              configMap:
+                name: pg-backup-scripts
+                defaultMode: 0755

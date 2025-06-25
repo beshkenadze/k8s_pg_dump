@@ -1,0 +1,796 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-backup-scripts
+data:
+  pg-connection-verify.sh: |
+    #!/bin/bash
+    # PostgreSQL connection verification script
+
+    # Function for sending metrics on failure
+    function send_connection_failure_metric {
+      local error_msg=$1
+      
+      if [ -n "$PUSHGATEWAY_URL" ] && [ -n "$ENVIRONMENT" ] && [ -n "$PGDATABASE" ]; then
+        METRICS="# TYPE pg_backup_connection_error gauge\n"
+        METRICS+="pg_backup_connection_error{step=\"postgres_connection\",message=\"$error_msg\"} 1\n"
+        
+        echo "Sending connection failure metric to $PUSHGATEWAY_URL..."
+        echo -e "$METRICS" | curl --data-binary @- "$PUSHGATEWAY_URL/metrics/job/pg_backup/database/$PGDATABASE/environment/$ENVIRONMENT" -v
+        if [ $? -eq 0 ]; then
+          echo "Successfully sent metrics to Pushgateway"
+        else
+          echo "WARNING: Failed to send metrics to Pushgateway"
+        fi
+      else
+        echo "WARNING: Can't send metrics - missing required environment variables"
+        echo "PUSHGATEWAY_URL: $PUSHGATEWAY_URL"
+        echo "ENVIRONMENT: $ENVIRONMENT"
+        echo "PGDATABASE: $PGDATABASE"
+      fi
+    }
+
+    # Function to check PostgreSQL connection
+    function check_pg_connection {
+      local max_attempts=${1:-3}
+      local wait_time=${2:-10}
+      local attempts=0
+      local connected=false
+      
+      echo "Verifying PostgreSQL connection to $PGHOST..."
+      
+      # Required variables check
+      if [ -z "$PGHOST" ] || [ -z "$PGUSER" ] || [ -z "$PGPASSWORD" ] || [ -z "$PGDATABASE" ]; then
+        echo "ERROR: Missing required PostgreSQL connection variables"
+        send_connection_failure_metric "Missing required PostgreSQL connection variables"
+        return 1
+      fi
+      
+      # Try to connect multiple times
+      while [ $attempts -lt $max_attempts ]; do
+        if PGPASSWORD=$PGPASSWORD psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" -c "SELECT 1" > /dev/null 2>&1; then
+          echo "Successfully connected to PostgreSQL database $PGDATABASE on $PGHOST"
+          connected=true
+          break
+        else
+          attempts=$((attempts+1))
+          error_msg=$(PGPASSWORD=$PGPASSWORD psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" -c "SELECT 1" 2>&1)
+          echo "Failed to connect to PostgreSQL (attempt $attempts/$max_attempts): $error_msg"
+          
+          if [ $attempts -ge $max_attempts ]; then
+            send_connection_failure_metric "$(echo $error_msg | tr '\n' ' ' | sed 's/\"/\\\"/g')"
+          else
+            sleep $wait_time
+          fi
+        fi
+      done
+      
+      if [ "$connected" = true ]; then
+        return 0
+      else
+        return 1
+      fi
+    }
+
+    # If script is run directly
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+      check_pg_connection "$MAX_RETRIES" "$RETRY_WAIT"
+      exit $?
+    fi
+
+  s3-connection-verify.sh: |
+    #!/bin/bash
+    # S3 connection verification script using s3cmd
+
+    # Function for sending metrics on failure
+    function send_connection_failure_metric {
+      local error_msg=$1
+      
+      if [ -n "$PUSHGATEWAY_URL" ] && [ -n "$ENVIRONMENT" ] && [ -n "$PGDATABASE" ]; then
+        METRICS="# TYPE pg_backup_connection_error gauge\n"
+        METRICS+="pg_backup_connection_error{step=\"s3_connection\",message=\"$error_msg\"} 1\n"
+        
+        echo "Sending connection failure metric to $PUSHGATEWAY_URL..."
+        echo -e "$METRICS" | curl --data-binary @- "$PUSHGATEWAY_URL/metrics/job/pg_backup/database/$PGDATABASE/environment/$ENVIRONMENT" -v
+        if [ $? -eq 0 ]; then
+          echo "Successfully sent metrics to Pushgateway"
+        else
+          echo "WARNING: Failed to send metrics to Pushgateway"
+        fi
+      else
+        echo "WARNING: Can't send metrics - missing required environment variables"
+        echo "PUSHGATEWAY_URL: $PUSHGATEWAY_URL"
+        echo "ENVIRONMENT: $ENVIRONMENT"
+        echo "PGDATABASE: $PGDATABASE"
+      fi
+    }
+
+    # Configure s3cmd
+    function configure_s3cmd {
+      # Create or update s3cmd config file
+      mkdir -p ~/.s3
+      echo "[default]" > ~/.s3cfg
+      echo "access_key = ${AWS_ACCESS_KEY_ID}" >> ~/.s3cfg
+      echo "secret_key = ${AWS_SECRET_ACCESS_KEY}" >> ~/.s3cfg
+      echo "use_https = True" >> ~/.s3cfg
+    }
+
+    # Function to check S3 connection
+    function check_s3_connection {
+      local max_attempts=${1:-3}
+      local wait_time=${2:-10}
+      local attempts=0
+      local connected=false
+      
+      echo "Verifying S3 connection to bucket path $S3_BUCKET_PATH..."
+      
+      # Required variables check
+      if [ -z "$S3_BUCKET_PATH" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+        echo "ERROR: Missing required S3 connection variables"
+        send_connection_failure_metric "Missing required S3 connection variables"
+        return 1
+      fi
+      
+      # Configure s3cmd with credentials
+      configure_s3cmd
+      
+      # Extract bucket name from S3_BUCKET_PATH
+      BUCKET_NAME=$(echo $S3_BUCKET_PATH | cut -d'/' -f1)
+      
+      # Try to connect multiple times
+      while [ $attempts -lt $max_attempts ]; do
+        if s3cmd ls s3://$BUCKET_NAME/ > /dev/null 2>&1; then
+          echo "Successfully connected to S3 bucket $BUCKET_NAME"
+          connected=true
+          
+          # Verify write access by creating a test file
+          echo "Verifying write access to S3..."
+          TEST_FILE="/tmp/s3_write_test_$(date +%s).txt"
+          echo "test" > $TEST_FILE
+          
+          if s3cmd put $TEST_FILE s3://$S3_BUCKET_PATH/test_write_access.txt > /dev/null 2>&1; then
+            echo "Successfully verified write access to S3 bucket path"
+            # Clean up test file
+            s3cmd rm s3://$S3_BUCKET_PATH/test_write_access.txt > /dev/null 2>&1
+            rm -f $TEST_FILE
+          else
+            error_msg=$(s3cmd put $TEST_FILE s3://$S3_BUCKET_PATH/test_write_access.txt 2>&1)
+            echo "Failed to write to S3 bucket path: $error_msg"
+            send_connection_failure_metric "Write permission denied: $(echo $error_msg | tr '\n' ' ' | sed 's/\"/\\\"/g')"
+            rm -f $TEST_FILE
+            return 1
+          fi
+          
+          break
+        else
+          attempts=$((attempts+1))
+          error_msg=$(s3cmd ls s3://$BUCKET_NAME/ 2>&1)
+          echo "Failed to connect to S3 (attempt $attempts/$max_attempts): $error_msg"
+          
+          if [ $attempts -ge $max_attempts ]; then
+            send_connection_failure_metric "$(echo $error_msg | tr '\n' ' ' | sed 's/\"/\\\"/g')"
+          else
+            sleep $wait_time
+          fi
+        fi
+      done
+      
+      if [ "$connected" = true ]; then
+        return 0
+      else
+        return 1
+      fi
+    }
+
+    # If script is run directly
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+      check_s3_connection "$MAX_RETRIES" "$RETRY_WAIT"
+      exit $?
+    fi
+
+  backup.sh: |
+    #!/bin/bash
+    set -e
+
+    # Import connection verification functions
+    source /scripts/pg-connection-verify.sh
+    source /scripts/s3-connection-verify.sh
+
+    # Set up error trapping
+    function cleanup {
+      # Remove temporary files
+      if [ -f "$DUMP_FILE" ]; then rm -f "$DUMP_FILE"; fi
+      if [ -f "$ENCRYPTED_FILE" ]; then rm -f "$ENCRYPTED_FILE"; fi
+      if [ -f dump_error.log ]; then rm -f dump_error.log; fi
+      if [ -f enc_error.log ]; then rm -f enc_error.log; fi
+      if [ -f s3_error.log ]; then rm -f s3_error.log; fi
+      if [ -f /tmp/backup_list.txt ]; then rm -f /tmp/backup_list.txt; fi
+    }
+
+    function calculate_backup_metrics {
+      echo "Collecting storage metrics from S3..."
+      # Set local variables for metrics
+      local backup_count=0
+      local backup_size=0
+      local UPDATE_METRICS=0
+
+      # Extract bucket name and path
+      local bucket_name=$(echo $S3_BUCKET_PATH | cut -d'/' -f1)
+
+      # Get prefix by removing bucket name
+      local s3_path
+      if [[ "$S3_BUCKET_PATH" == *"/"* ]]; then
+        local prefix=$(echo $S3_BUCKET_PATH | cut -d'/' -f2-)
+        s3_path="s3://$bucket_name/$prefix"
+      else
+        s3_path="s3://$bucket_name/"
+      fi
+
+      # Get metrics with better filename filtering
+      if s3cmd ls $s3_path > /tmp/backup_list.txt 2>/dev/null; then
+        # Process each backup file
+        cat /tmp/backup_list.txt | grep -E "\.sql\.enc$" | while IFS= read -r line; do
+          # Format: DATE TIME SIZE s3://PATH
+          # Extract size (third field in s3cmd output)
+          local file_size=$(echo "$line" | awk '{print $3}')
+
+          # Validate the size is numeric
+          if [[ "$file_size" =~ ^[0-9]+$ ]]; then
+            backup_count=$((backup_count + 1))
+            backup_size=$((backup_size + file_size))
+          fi
+        done
+
+        # Set global variables
+        TOTAL_BACKUP_COUNT=$backup_count
+        TOTAL_BACKUP_SIZE=$backup_size
+        UPDATE_METRICS=1
+
+        # Human-readable reporting
+        local size_human
+        if [ "$backup_size" -gt 1073741824 ]; then
+          size_human=$(echo "scale=2; $backup_size/1073741824" | bc)
+          echo "Storage metrics: $backup_count files, total size: $backup_size bytes ($size_human GB)"
+        elif [ "$backup_size" -gt 1048576 ]; then
+          size_human=$(echo "scale=2; $backup_size/1048576" | bc)
+          echo "Storage metrics: $backup_count files, total size: $backup_size bytes ($size_human MB)"
+        elif [ "$backup_size" -gt 1024 ]; then
+          size_human=$(echo "scale=2; $backup_size/1024" | bc)
+          echo "Storage metrics: $backup_count files, total size: $backup_size bytes ($size_human KB)"
+        else
+          echo "Storage metrics: $backup_count files, total size: $backup_size bytes"
+        fi
+      else
+        echo "WARNING: Failed to calculate backup metrics from S3, using default values (0 files, 0 bytes)"
+      fi
+    }
+
+    function send_metrics {
+      local status=$1
+      local step=$2
+      local error_msg=$3
+      local UPDATE_METRICS=${UPDATE_METRICS:-0}
+
+      END=$(date +%s)
+      DURATION=$((END - START))
+
+      METRICS="# TYPE pg_backup_success gauge\n"
+      METRICS+="pg_backup_success $status\n"
+      METRICS+="# TYPE pg_backup_duration_seconds gauge\n"
+      METRICS+="pg_backup_duration_seconds $DURATION\n"
+
+      if [ "$status" -eq 0 ] && [ -f "$ENCRYPTED_FILE" ]; then
+        SIZE=$(stat -c%s "$ENCRYPTED_FILE")
+        METRICS+="# TYPE pg_backup_encrypted_size_bytes gauge\n"
+        METRICS+="pg_backup_encrypted_size_bytes $SIZE\n"
+      fi
+
+      # Add retention metrics (always include, initialized to 0)
+      METRICS+="# TYPE pg_backup_expired_count gauge\n"
+      METRICS+="pg_backup_expired_count $DELETED_COUNT\n"
+
+      # Add individual backup size metric with timestamp and filename labels
+      if [ "$status" -eq 0 ] && [ -f "$ENCRYPTED_FILE" ]; then
+        BACKUP_FILENAME=$(basename "$ENCRYPTED_FILE")
+        TIMESTAMP=$(date +%s)
+        METRICS+="# TYPE pg_backup_file_size_bytes gauge\n"
+        METRICS+="pg_backup_file_size_bytes{timestamp=\"$TIMESTAMP\",filename=\"$BACKUP_FILENAME\"} $SIZE\n"
+      fi
+
+      # Add total backup size and count metrics (always include, initialized to 0)
+      # If metrics weren't updated by retention policy, try to get them now
+      if [ "$UPDATE_METRICS" -eq 0 ]; then
+        # Use the dedicated function to calculate metrics
+        calculate_backup_metrics
+      fi
+
+      # Always include these metrics
+      METRICS+="# TYPE pg_backup_total_size_bytes gauge\n"
+      METRICS+="pg_backup_total_size_bytes $TOTAL_BACKUP_SIZE\n"
+      METRICS+="# TYPE pg_backup_file_count gauge\n"
+      METRICS+="pg_backup_file_count $TOTAL_BACKUP_COUNT\n"
+
+      if [ -n "$error_msg" ]; then
+        METRICS+="# TYPE pg_backup_error gauge\n"
+        METRICS+="pg_backup_error{step=\"$step\",message=\"$error_msg\"} 1\n"
+      fi
+      
+      # Add environment label if available
+      echo "Sending metrics to Pushgateway at $PUSHGATEWAY_URL..."
+      if [ -n "$ENVIRONMENT" ]; then
+        ENDPOINT="$PUSHGATEWAY_URL/metrics/job/pg_backup/database/$PGDATABASE/environment/$ENVIRONMENT"
+      else
+        ENDPOINT="$PUSHGATEWAY_URL/metrics/job/pg_backup/database/$PGDATABASE"
+      fi
+      
+      echo "Metrics endpoint: $ENDPOINT"
+      echo "Metrics content: "
+      echo -e "$METRICS"
+      
+      # Test Pushgateway connectivity using the health endpoint
+      PUSHGATEWAY_HOST=$(echo "$PUSHGATEWAY_URL" | sed -E 's|https?://||' | cut -d/ -f1)
+      if curl -s --fail "http://${PUSHGATEWAY_HOST}/-/healthy" > /dev/null; then
+        echo "Pushgateway is reachable and healthy"
+      else
+        echo "WARNING: Pushgateway health check failed at http://${PUSHGATEWAY_HOST}/-/healthy"
+        echo "Attempting to push metrics anyway, in case health check failed but push would succeed"
+      fi
+      
+      # Send metrics with verbose output
+      echo -e "$METRICS" | curl --data-binary @- "$ENDPOINT" -v
+      RESULT=$?
+      
+      if [ $RESULT -eq 0 ]; then
+        echo "Successfully sent metrics to Pushgateway"
+      else
+        echo "WARNING: Failed to send metrics to Pushgateway (exit code: $RESULT)"
+      fi
+    }
+
+    # Register cleanup function to run on exit
+    trap cleanup EXIT
+
+    # Environment-specific debug output
+    if [ "$ENABLE_DEBUG" = "true" ]; then
+      echo "Starting backup job in ${ENVIRONMENT:-PROD} environment at $(date)"
+      echo "Database: $PGDATABASE"
+      echo "Host: $PGHOST"
+      echo "S3 Path: $S3_BUCKET_PATH"
+      echo "Pushgateway URL: $PUSHGATEWAY_URL"
+    fi
+
+    # Install necessary tools
+    echo "Installing required packages..."
+    apt-get update && apt-get install -y curl postgresql-client s3cmd
+
+    # Initialize variables
+    DUMP_FILE=/tmp/${PGDATABASE}_backup_$(date +%F_%H-%M-%S).sql
+    ENCRYPTED_FILE=$DUMP_FILE.enc
+    START=$(date +%s)
+
+    # Initialize metrics variables
+    TOTAL_BACKUP_SIZE=0
+    TOTAL_BACKUP_COUNT=0
+    DELETED_COUNT=0
+    UPDATE_METRICS=0
+
+    # Set retry parameters (use environment variables if provided, otherwise defaults)
+    MAX_RETRY_COUNT=${MAX_RETRIES:-3}
+    RETRY_WAIT_TIME=${RETRY_WAIT:-30}
+
+    # Verify PostgreSQL connection
+    echo "Verifying PostgreSQL connection..."
+    if ! check_pg_connection "$MAX_RETRY_COUNT" "$RETRY_WAIT_TIME"; then
+      echo "ERROR: Failed to connect to PostgreSQL after $MAX_RETRY_COUNT attempts"
+      exit 1
+    fi
+
+    # Configure s3cmd with credentials
+    configure_s3cmd
+
+    # Verify S3 connection
+    echo "Verifying S3 connection..."
+    if ! check_s3_connection "$MAX_RETRY_COUNT" "$RETRY_WAIT_TIME"; then
+      echo "ERROR: Failed to connect to S3 after $MAX_RETRY_COUNT attempts"
+      exit 1
+    fi
+
+    # Dump database with retries
+    echo "Dumping database..."
+    ATTEMPTS=0
+    while [ $ATTEMPTS -lt $MAX_RETRY_COUNT ]; do
+      if pg_dump -U "$PGUSER" -h "$PGHOST" -F c -d "$PGDATABASE" > "$DUMP_FILE" 2>dump_error.log; then
+        [ "$ENABLE_DEBUG" = "true" ] && echo "Database dump completed successfully!"
+        break
+      else
+        ATTEMPTS=$((ATTEMPTS+1))
+        ERROR_MSG=$(cat dump_error.log | tr '\n' ' ' | sed 's/\"/\\\"/g')
+        echo "Dump failed (attempt $ATTEMPTS/$MAX_RETRY_COUNT): $ERROR_MSG"
+        if [ $ATTEMPTS -ge $MAX_RETRY_COUNT ]; then
+          send_metrics 0 "pg_dump" "$ERROR_MSG"
+          exit 1
+        fi
+        sleep $RETRY_WAIT_TIME
+      fi
+    done
+
+    # Encrypt dump
+    echo "Encrypting dump..."
+    if ! openssl enc -aes-256-cbc -salt -in "$DUMP_FILE" -out "$ENCRYPTED_FILE" -pass pass:"$BACKUP_PASSWORD" 2>enc_error.log; then
+      ERROR_MSG=$(cat enc_error.log | tr '\n' ' ' | sed 's/\"/\\\"/g')
+      echo "Encryption failed: $ERROR_MSG"
+      send_metrics 0 "encrypt" "$ERROR_MSG"
+      exit 1
+    fi
+    [ "$ENABLE_DEBUG" = "true" ] && echo "Encryption completed successfully!"
+
+    # Upload to S3 with retries
+    echo "Uploading to S3..."
+    ATTEMPTS=0
+    while [ $ATTEMPTS -lt $MAX_RETRY_COUNT ]; do
+      if s3cmd put "$ENCRYPTED_FILE" s3://$S3_BUCKET_PATH/$(basename $ENCRYPTED_FILE) 2>s3_error.log; then
+        [ "$ENABLE_DEBUG" = "true" ] && echo "S3 upload completed successfully!"
+        break
+      else
+        ATTEMPTS=$((ATTEMPTS+1))
+        ERROR_MSG=$(cat s3_error.log | tr '\n' ' ' | sed 's/\"/\\\"/g')
+        echo "S3 upload failed (attempt $ATTEMPTS/$MAX_RETRY_COUNT): $ERROR_MSG"
+        if [ $ATTEMPTS -ge $MAX_RETRY_COUNT ]; then
+          send_metrics 0 "s3_upload" "$ERROR_MSG"
+          exit 1
+        fi
+        sleep $RETRY_WAIT_TIME
+      fi
+    done
+
+    # Create a manifest file for debugging if requested
+    if [ "$CREATE_MANIFEST" = "true" ]; then
+      echo "Creating backup manifest for tracking..."
+      MANIFEST="{\"database\":\"$PGDATABASE\",\"timestamp\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",\"file\":\"$(basename $ENCRYPTED_FILE)\",\"size\":\"$(stat -c%s "$ENCRYPTED_FILE")\",\"environment\":\"${ENVIRONMENT:-prod}\"}"
+      echo $MANIFEST > /tmp/manifest.json
+      s3cmd put /tmp/manifest.json s3://$S3_BUCKET_PATH/manifests/$(basename $ENCRYPTED_FILE).json
+      rm -f /tmp/manifest.json
+    fi
+
+    # Apply retention policy if configured
+    if [ -n "$RETENTION_DAYS" ] && [ "$RETENTION_DAYS" -gt 0 ]; then
+      echo "Applying retention policy: keeping backups for $RETENTION_DAYS days..."
+
+      # Extract bucket name and path from S3_BUCKET_PATH
+      BUCKET_NAME=$(echo $S3_BUCKET_PATH | cut -d'/' -f1)
+
+      # Get prefix by removing bucket name
+      if [[ "$S3_BUCKET_PATH" == *"/"* ]]; then
+        PREFIX=$(echo $S3_BUCKET_PATH | cut -d'/' -f2-)
+        S3_PATH="s3://$BUCKET_NAME/$PREFIX"
+      else
+        S3_PATH="s3://$BUCKET_NAME/"
+      fi
+
+      # List all backups
+      echo "Listing backups in $S3_PATH..."
+      s3cmd ls $S3_PATH | grep ".sql.enc$" > /tmp/backup_list.txt
+
+      # Get current timestamp
+      CURRENT_TIMESTAMP=$(date +%s)
+
+      # Calculate cutoff timestamp (current time - retention period in seconds)
+      RETENTION_SECONDS=$((RETENTION_DAYS * 24 * 60 * 60))
+      CUTOFF_TIMESTAMP=$((CURRENT_TIMESTAMP - RETENTION_SECONDS))
+
+      # Process the list of backups to find ones older than retention period
+      echo "Finding backups older than $RETENTION_DAYS days..."
+      DELETED_COUNT=0
+
+      # Initialize tracking variables for retained backups
+      TOTAL_BACKUP_SIZE=0
+      TOTAL_BACKUP_COUNT=0
+
+      while read -r line; do
+        # Extract date, size, and filename from s3cmd ls output format
+        # Line format: YYYY-MM-DD HH:MM:SS SIZE s3://bucket/path/filename
+        BACKUP_DATE=$(echo "$line" | awk '{print $1}')
+        BACKUP_TIME=$(echo "$line" | awk '{print $2}')
+        BACKUP_SIZE=$(echo "$line" | awk '{print $3}')  # Size in bytes, 3rd field
+        BACKUP_PATH=$(echo "$line" | awk '{print $4}')
+        BACKUP_FILENAME=$(basename "$BACKUP_PATH")
+
+        # Convert backup date to timestamp
+        BACKUP_TIMESTAMP=$(date -d "${BACKUP_DATE} ${BACKUP_TIME}" +%s 2>/dev/null)
+        if [ $? -ne 0 ]; then
+          # macOS fallback for date command
+          BACKUP_TIMESTAMP=$(date -j -f "%Y-%m-%d %H:%M:%S" "${BACKUP_DATE} ${BACKUP_TIME}" +%s 2>/dev/null)
+        fi
+
+        # Skip if we couldn't parse the date (shouldn't happen with s3cmd output)
+        if [ -z "$BACKUP_TIMESTAMP" ]; then
+          echo "WARNING: Couldn't parse date for $BACKUP_FILENAME, skipping"
+          continue
+        fi
+
+        # Check if backup is older than retention period
+        if [ "$BACKUP_TIMESTAMP" -lt "$CUTOFF_TIMESTAMP" ]; then
+          echo "Deleting expired backup: $BACKUP_FILENAME ($(date -d @$BACKUP_TIMESTAMP '+%Y-%m-%d %H:%M:%S'))"
+
+          # Delete encrypted backup file
+          s3cmd rm "$BACKUP_PATH" 2>/dev/null
+
+          # Delete manifest file if it exists
+          if [ "$CREATE_MANIFEST" = "true" ]; then
+            s3cmd rm "s3://$S3_BUCKET_PATH/manifests/$BACKUP_FILENAME.json" 2>/dev/null
+          fi
+
+          DELETED_COUNT=$((DELETED_COUNT + 1))
+        else
+          # This backup is within retention period, add to totals
+          TOTAL_BACKUP_COUNT=$((TOTAL_BACKUP_COUNT + 1))
+          TOTAL_BACKUP_SIZE=$((TOTAL_BACKUP_SIZE + BACKUP_SIZE))
+        fi
+      done < /tmp/backup_list.txt
+
+      echo "Retention policy applied: $DELETED_COUNT expired backups removed"
+
+      # Calculate updated metrics after retention policy has been applied
+      calculate_backup_metrics
+    fi
+
+    # Success - Send metrics
+    echo "Backup completed successfully!"
+    send_metrics 1 "" ""
+    [ "$ENABLE_DEBUG" = "true" ] && echo "Backup job completed at $(date)"
+    exit 0
+
+  validate.sh: |
+    #!/bin/bash
+    set -e
+
+    # Import connection verification functions
+    source /scripts/pg-connection-verify.sh
+    source /scripts/s3-connection-verify.sh
+
+    # Set up error trapping
+    function cleanup {
+      # Remove temporary files
+      if [ -f "$DOWNLOADED_FILE" ]; then rm -f "$DOWNLOADED_FILE"; fi
+      if [ -f "$DECRYPTED_FILE" ]; then rm -f "$DECRYPTED_FILE"; fi
+      if [ -f /tmp/s3_list.txt ]; then rm -f /tmp/s3_list.txt; fi
+      if [ -f /tmp/validation_output.txt ]; then rm -f /tmp/validation_output.txt; fi
+    }
+
+    # Function to send validation metrics
+    function send_validation_metrics {
+      local status=$1
+      local step=$2
+      local error_msg=$3
+      local table_count=${4:-0}
+      local backup_age_hours=${5:-0}
+      local backup_size=${6:-0}
+      
+      local timestamp=$(date +%s)
+      
+      METRICS="# TYPE pg_backup_validation_success gauge\n"
+      METRICS+="pg_backup_validation_success $status\n"
+      METRICS+="# TYPE pg_backup_validation_timestamp gauge\n"
+      METRICS+="pg_backup_validation_timestamp $timestamp\n"
+      METRICS+="# TYPE pg_backup_validation_age_hours gauge\n"
+      METRICS+="pg_backup_validation_age_hours $backup_age_hours\n"
+      METRICS+="# TYPE pg_backup_validation_table_count gauge\n"
+      METRICS+="pg_backup_validation_table_count $table_count\n"
+      METRICS+="# TYPE pg_backup_validation_size_bytes gauge\n"
+      METRICS+="pg_backup_validation_size_bytes $backup_size\n"
+      
+      if [ "$status" -eq 0 ]; then
+        METRICS+="# TYPE pg_backup_validation_error gauge\n"
+        METRICS+="pg_backup_validation_error 0\n"
+      else
+        METRICS+="# TYPE pg_backup_validation_error gauge\n"
+        METRICS+="pg_backup_validation_error{step=\"$step\",message=\"$error_msg\"} 1\n"
+      fi
+      
+      if [ -n "$PUSHGATEWAY_URL" ] && [ -n "$ENVIRONMENT" ] && [ -n "$PGDATABASE" ]; then
+        echo "Sending validation metrics to $PUSHGATEWAY_URL..."
+        echo -e "$METRICS" | curl --data-binary @- "$PUSHGATEWAY_URL/metrics/job/pg_backup_validation/database/$PGDATABASE/environment/$ENVIRONMENT" -v
+        if [ $? -eq 0 ]; then
+          echo "Successfully sent validation metrics to Pushgateway"
+        else
+          echo "WARNING: Failed to send validation metrics to Pushgateway"
+        fi
+      else
+        echo "WARNING: Can't send metrics - missing required environment variables"
+        echo "PUSHGATEWAY_URL: $PUSHGATEWAY_URL"
+        echo "ENVIRONMENT: $ENVIRONMENT"
+        echo "PGDATABASE: $PGDATABASE"
+      fi
+    }
+
+    # Function to get latest backup from S3
+    function get_latest_backup {
+      echo "Finding latest backup in S3..."
+      
+      # Configure s3cmd
+      configure_s3cmd
+      
+      # List all backup files and find the latest one
+      s3cmd ls s3://$S3_BUCKET_PATH/ | grep "\.sql\.enc$" > /tmp/s3_list.txt
+      
+      if [ ! -s /tmp/s3_list.txt ]; then
+        echo "ERROR: No backup files found in S3"
+        send_validation_metrics 0 "s3_list" "No backup files found in S3"
+        exit 1
+      fi
+      
+      # Get the latest file (s3cmd ls sorts by date)
+      LATEST_BACKUP=$(tail -n 1 /tmp/s3_list.txt | awk '{print $4}')
+      BACKUP_DATE=$(tail -n 1 /tmp/s3_list.txt | awk '{print $1 " " $2}')
+      BACKUP_SIZE=$(tail -n 1 /tmp/s3_list.txt | awk '{print $3}')
+      
+      echo "Latest backup found: $LATEST_BACKUP"
+      echo "Backup date: $BACKUP_DATE"
+      echo "Backup size: $(numfmt --to=iec --suffix=B $BACKUP_SIZE)"
+      
+      # Calculate backup age in hours
+      BACKUP_TIMESTAMP=$(date -d "$BACKUP_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$BACKUP_DATE" +%s 2>/dev/null)
+      CURRENT_TIMESTAMP=$(date +%s)
+      BACKUP_AGE_HOURS=$(( (CURRENT_TIMESTAMP - BACKUP_TIMESTAMP) / 3600 ))
+      
+      echo "Backup age: $BACKUP_AGE_HOURS hours"
+      
+      # Check if backup is too old (>25 hours to account for schedule drift)
+      if [ "$BACKUP_AGE_HOURS" -gt 25 ]; then
+        echo "ERROR: Backup is too old ($BACKUP_AGE_HOURS hours)"
+        send_validation_metrics 0 "backup_age" "Backup is $BACKUP_AGE_HOURS hours old" 0 $BACKUP_AGE_HOURS $BACKUP_SIZE
+        exit 1
+      fi
+      
+      return 0
+    }
+
+    # Function to download and decrypt backup
+    function download_and_decrypt {
+      echo "Downloading latest backup..."
+      
+      DOWNLOADED_FILE="/tmp/$(basename $LATEST_BACKUP)"
+      DECRYPTED_FILE="${DOWNLOADED_FILE%.enc}"
+      
+      # Download the file
+      if ! s3cmd get "$LATEST_BACKUP" "$DOWNLOADED_FILE" 2>/dev/null; then
+        echo "ERROR: Failed to download backup file"
+        send_validation_metrics 0 "download" "Failed to download backup from S3" 0 $BACKUP_AGE_HOURS $BACKUP_SIZE
+        exit 1
+      fi
+      
+      echo "Downloaded: $(basename $DOWNLOADED_FILE) ($(numfmt --to=iec --suffix=B $(stat -c%s "$DOWNLOADED_FILE")))"
+      
+      # Decrypt the file
+      echo "Decrypting backup..."
+      if ! openssl enc -d -aes-256-cbc -in "$DOWNLOADED_FILE" -out "$DECRYPTED_FILE" -pass pass:"$BACKUP_PASSWORD" 2>/dev/null; then
+        echo "ERROR: Failed to decrypt backup file"
+        send_validation_metrics 0 "decrypt" "Failed to decrypt backup file" 0 $BACKUP_AGE_HOURS $BACKUP_SIZE
+        exit 1
+      fi
+      
+      echo "Decrypted successfully: $(basename $DECRYPTED_FILE) ($(numfmt --to=iec --suffix=B $(stat -c%s "$DECRYPTED_FILE")))"
+      return 0
+    }
+
+    # Function to validate backup content
+    function validate_backup_content {
+      echo "Validating backup content..."
+      
+      # Check if it's a valid PostgreSQL dump
+      if ! head -c 8 "$DECRYPTED_FILE" | grep -q "PGDMP"; then
+        echo "ERROR: File is not a valid PostgreSQL custom format dump"
+        send_validation_metrics 0 "format" "Invalid PostgreSQL dump format" 0 $BACKUP_AGE_HOURS $BACKUP_SIZE
+        exit 1
+      fi
+      
+      echo "✓ Valid PostgreSQL custom format detected"
+      
+      # Extract detailed information using pg_restore
+      if command -v pg_restore >/dev/null 2>&1; then
+        echo "Analyzing backup structure..."
+        
+        # Get object counts
+        local object_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | wc -l | tr -d ' ')
+        local table_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep -c "TABLE DATA" || echo "0")
+        local index_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep -c "INDEX" || echo "0")
+        local sequence_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep -c "SEQUENCE" || echo "0")
+        local fk_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep -c "FK CONSTRAINT" || echo "0")
+        local function_count=$(pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep -c "FUNCTION" || echo "0")
+        
+        echo "✓ Database objects: $object_count"
+        echo "✓ Tables: $table_count"
+        echo "✓ Indexes: $index_count"
+        echo "✓ Sequences: $sequence_count"
+        echo "✓ Foreign keys: $fk_count"
+        echo "✓ Functions: $function_count"
+        
+        # List all tables
+        echo "✓ Tables found:"
+        pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep "TABLE DATA" | \
+        sed 's/.*TABLE DATA \([^ ]*\) \([^ ]*\).*/    \1.\2/' | sort | head -20
+        
+        if [ "$table_count" -gt 20 ]; then
+          echo "    ... and $((table_count - 20)) more tables"
+        fi
+        
+        # Schema breakdown
+        echo "✓ Schema breakdown:"
+        pg_restore --list "$DECRYPTED_FILE" 2>/dev/null | grep "TABLE DATA" | \
+        sed 's/.*TABLE DATA \([^ ]*\) \([^ ]*\).*/\1/' | sort | uniq -c | \
+        while read count schema; do
+          echo "    - Schema '$schema': $count tables"
+        done
+        
+        # Store table count for metrics
+        TABLE_COUNT=$table_count
+        
+      else
+        echo "WARNING: pg_restore not available - limited validation"
+        TABLE_COUNT=0
+      fi
+      
+      # Calculate MD5 checksum for integrity
+      local md5_hash=$(md5sum "$DECRYPTED_FILE" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+      echo "✓ MD5 checksum: $md5_hash"
+      
+      return 0
+    }
+
+    # Register cleanup function
+    trap cleanup EXIT
+
+    # Environment-specific debug output
+    if [ "$ENABLE_DEBUG" = "true" ]; then
+      echo "Starting backup validation job in ${ENVIRONMENT:-PROD} environment at $(date)"
+      echo "Pushgateway URL: $PUSHGATEWAY_URL"
+    fi
+
+    # Install necessary tools
+    echo "Installing required packages..."
+    apt-get update && apt-get install -y curl postgresql-client s3cmd
+
+    # Initialize variables
+    START=$(date +%s)
+    TABLE_COUNT=0
+    BACKUP_AGE_HOURS=0
+    BACKUP_SIZE=0
+
+    # Set retry parameters
+    MAX_RETRY_COUNT=${MAX_RETRIES:-3}
+    RETRY_WAIT_TIME=${RETRY_WAIT:-30}
+
+    # Verify PostgreSQL connection
+    echo "Verifying PostgreSQL connection..."
+    if ! check_pg_connection "$MAX_RETRY_COUNT" "$RETRY_WAIT_TIME"; then
+      echo "ERROR: Failed to connect to PostgreSQL after $MAX_RETRY_COUNT attempts"
+      send_validation_metrics 0 "postgres_connection" "Failed to connect to PostgreSQL"
+      exit 1
+    fi
+
+    # Verify S3 connection
+    echo "Verifying S3 connection..."
+    if ! check_s3_connection "$MAX_RETRY_COUNT" "$RETRY_WAIT_TIME"; then
+      echo "ERROR: Failed to connect to S3 after $MAX_RETRY_COUNT attempts"
+      send_validation_metrics 0 "s3_connection" "Failed to connect to S3"
+      exit 1
+    fi
+
+    # Get latest backup from S3
+    get_latest_backup
+
+    # Download and decrypt backup
+    download_and_decrypt
+
+    # Validate backup content
+    validate_backup_content
+
+    # Success - Send metrics
+    echo "✓ Backup validation completed successfully!"
+    echo "✓ Backup age: $BACKUP_AGE_HOURS hours"
+    echo "✓ Tables validated: $TABLE_COUNT"
+    echo "✓ Backup size: $(numfmt --to=iec --suffix=B $BACKUP_SIZE)"
+
+    send_validation_metrics 1 "" "" $TABLE_COUNT $BACKUP_AGE_HOURS $BACKUP_SIZE
+    [ "$ENABLE_DEBUG" = "true" ] && echo "Validation job completed at $(date)"
+    exit 0
